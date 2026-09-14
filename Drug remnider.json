@@ -1,0 +1,794 @@
+{
+  "name": "My workflow 4",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Layer 1: regex for structured identifiers.\nconst patterns = {\n  SSN: /\\b\\d{3}-\\d{2}-\\d{4}\\b/g,\n  PHONE_EG: /\\b(?:\\+?20[ -]?|0)1[0125]\\d{8}\\b/g,\n  PHONE_INTL: /\\b(?:\\+?\\d{1,3}[ -]?)?\\(?\\d{3}\\)?[ -]?\\d{3}[ -]?\\d{4}\\b/g,\n  NATIONAL_ID_EG: /\\b[23]\\d{13}\\b/g,\n  EMAIL: /\\b[\\w.%+-]+@[\\w.-]+\\.[A-Za-z]{2,}\\b/g,\n  MRN: /\\bMRN[:# ]?\\s?\\d{6,10}\\b/gi,\n  DATE: /\\b\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b/g,\n  IP: /\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b/g,\n  URL: /\\bhttps?:\\/\\/[^\\s]+\\b/g,\n  ACCOUNT: /\\bACCT[:# ]?\\s?\\d{6,12}\\b/gi\n};\n\nconst out = [];\nfor (const item of $input.all()) {\n  const text = item.json.chatInput\n    || item.json.text\n    || item.json.body?.text\n    || '';\n\n  const spans = [];\n  for (const [type, re] of Object.entries(patterns)) {\n    for (const m of text.matchAll(re)) {\n      spans.push({\n        type,\n        start: m.index,\n        end: m.index + m[0].length,\n        value: m[0],\n        source: 'regex'\n      });\n    }\n  }\n\n  out.push({\n    json: {\n      request_id: item.json.request_id || $execution.id,\n      text: text,\n      spans: spans\n    }\n  });\n}\n\nreturn out;"
+      },
+      "id": "26563ecf-7429-4fed-81b3-06c527b9a076",
+      "name": "Regex detect",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1856,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:3000/analyze",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ \nJSON.stringify({\n  \"text\": $(\"Regex detect\").item.json.text,\n  \"language\": \"en\",\n  \"score_threshold\": 0.6,\n  \"entities\": [\"PERSON\", \"PHONE_NUMBER\", \"EMAIL_ADDRESS\", \"LOCATION\"]\n}) \n}}",
+        "options": {}
+      },
+      "id": "a30291f9-ec95-46c6-87d6-a360d4fc8b0a",
+      "name": "Presidio analyze",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1712,
+        336
+      ],
+      "alwaysOutputData": true,
+      "notes": "Lower score_threshold catches more PHI at the cost of false positives (Veracity trade-off)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputData = $input.item.json;\n\n// جلب النص القادم من الـ Guardian أو الـ Output Validator بأي مسمى كان\nlet textToProcess = inputData.output || inputData.text || inputData.validatedOutput || inputData.finalResponse || \"\";\nconst mapping = inputData.mapping || {};\n\nlet restoredCount = 0;\n\n// استبدال التوكينات بالبيانات الأصلية\nif (mapping && typeof mapping === 'object' && Object.keys(mapping).length > 0) {\n  for (const [token, originalValue] of Object.entries(mapping)) {\n    if (textToProcess.includes(token)) {\n      textToProcess = textToProcess.split(token).join(originalValue);\n      restoredCount++;\n    }\n  }\n}\n\nreturn {\n  json: {\n    finalAnswer: textToProcess, // اسم المتغير الثابت والمضمون\n    tokens_restored: restoredCount,\n    request_id: inputData.request_id || \"\"\n  }\n};"
+      },
+      "id": "f08c88c8-22d6-4ce8-bd61-e251bd2ed9fd",
+      "name": "Re-identify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseMode": "responseNodes"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -2032,
+        352
+      ],
+      "id": "8b1941bb-a306-4487-83c8-1d856694d213",
+      "name": "When chat message received",
+      "webhookId": "6185f252-31c2-444e-8bb3-550a97a9ea72"
+    },
+    {
+      "parameters": {
+        "jsCode": "// De-identification node.\n// Inputs: spans from the regex node + entities from the Presidio node.\n// Token format: [TYPE_<timeCode>_<rand>]\nconst REGEX_NODE = 'Regex detect';\nconst PRESIDIO_NODE = 'Presidio analyze';\n\n// --- Input 1: regex node (carries the original text and its spans) ---\nconst base = $(REGEX_NODE).first().json;\nconst text = base.text || '';\nconst regexSpans = (base.spans || []).map(s => ({ ...s, source: 'regex', score: s.score ?? 1 }));\n\n// --- Input 2: Presidio node ---\n// The HTTP Request node may hand back one item holding an array,\n// or one item per entity. Handle both, and fall back to $input.\nlet presidioItems;\ntry {\n  presidioItems = $(PRESIDIO_NODE).all().map(i => i.json);\n} catch (e) {\n  presidioItems = $input.all().map(i => i.json);\n}\n\nlet rawEntities = [];\nif (presidioItems.length === 1 && Array.isArray(presidioItems[0])) {\n  rawEntities = presidioItems[0];\n} else if (presidioItems.length === 1 && Array.isArray(presidioItems[0]?.results)) {\n  rawEntities = presidioItems[0].results;\n} else {\n  rawEntities = presidioItems.filter(x => x && x.entity_type);\n}\n\nconst nerSpans = rawEntities\n  .filter(r => typeof r.start === 'number' && typeof r.end === 'number')\n  .map(r => ({\n    type: r.entity_type,\n    start: r.start,\n    end: r.end,\n    value: text.slice(r.start, r.end),\n    source: 'presidio',\n    score: r.score\n  }));\n\n// --- Merge both layers, drop overlaps ---\nconst all = [...regexSpans, ...nerSpans].sort(\n  (a, b) => a.start - b.start\n    || (b.end - b.start) - (a.end - a.start)\n    || (b.score || 1) - (a.score || 1)\n);\n\nconst merged = [];\nfor (const s of all) {\n  if (!merged.length || s.start >= merged[merged.length - 1].end) merged.push(s);\n}\n\n// --- Time-coded random tokens ---\nconst issuedAt = Date.now();\nconst timeCode = issuedAt.toString(36).toUpperCase();\nlet counter = 0;\nconst randomSuffix = () => {\n  counter++;\n  const a = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');\n  const b = (issuedAt ^ (counter * 0x9e3779b1)).toString(16).slice(-4);\n  return (a + b).toUpperCase().slice(0, 6);\n};\n\n// One token per distinct value, so repeated mentions stay linked.\nconst byValue = new Map();\nconst mapping = {};\nconst identifiers = [];\n\nfor (const s of merged) {\n  const dedupeKey = s.type + '|' + s.value.trim().toLowerCase().replace(/\\s+/g, ' ');\n  if (!byValue.has(dedupeKey)) {\n    const token = `[${s.type}_${timeCode}_${randomSuffix()}]`;\n    byValue.set(dedupeKey, token);\n    mapping[token] = s.value;\n    identifiers.push({\n      token,\n      entity_type: s.type,\n      detected_by: s.source,\n      score: s.score,\n      issued_at: new Date(issuedAt).toISOString(),\n      occurrences: 1\n    });\n  } else {\n    identifiers.find(x => x.token === byValue.get(dedupeKey)).occurrences++;\n  }\n  s.token = byValue.get(dedupeKey);\n}\n\n// Replace right-to-left so earlier offsets stay valid.\nlet deidentified = text;\nfor (let i = merged.length - 1; i >= 0; i--) {\n  const s = merged[i];\n  deidentified = deidentified.slice(0, s.start) + s.token + deidentified.slice(s.end);\n}\n\nconst counts = merged.reduce((acc, s) => { acc[s.type] = (acc[s.type] || 0) + 1; return acc; }, {});\n\nreturn [{ json: {\n  request_id: base.request_id || $execution.id,\n  mode: 'tokenize',\n  reversible: true,\n  issued_at: new Date(issuedAt).toISOString(),\n  time_code: timeCode,\n  expires_at: new Date(issuedAt + 300000).toISOString(),\n  deidentified_text: deidentified,\n  identifiers,\n  mapping,\n  entity_counts: counts,\n  detected_by_regex: regexSpans.length,\n  detected_by_presidio: nerSpans.length,\n  dropped_as_overlap: (regexSpans.length + nerSpans.length) - merged.length,\n  total_entities: merged.length,\n  distinct_entities: Object.keys(mapping).length,\n  recognizers: [...new Set(merged.map(s => s.source))]\n}}];"
+      },
+      "id": "4920a124-d745-4626-80c6-4add15fff7d0",
+      "name": "De-identify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1504,
+        192
+      ],
+      "notes": "Mapping never leaves this workflow run. For async, encrypt and store in Redis with TTL <= 300 s."
+    },
+    {
+      "parameters": {
+        "message": "={{ $json.finalAnswer }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.3,
+      "position": [
+        832,
+        432
+      ],
+      "id": "36d4ad0d-2904-452a-9f80-89155b75aa3b",
+      "name": "Chat",
+      "webhookId": "e34d0ad3-50c2-4c16-8234-78a4fa72663f",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputItem = $input.item.json;\n\n// جلب النص المجهل\nconst deidentifiedText = inputItem.deidentified_text || inputItem.deidentified || inputItem.text || \"\";\nconst mapping = inputItem.mapping || {};\nconst requestId = inputItem.request_id || $execution.id;\n\n// 1. Canonicalization\nconst normalizedText = deidentifiedText.normalize('NFKC').toLowerCase();\n\n// 2. Blacklist Check\nconst maliciousPatterns = [\n  /ignore\\s+(all\\s+)?instructions/i,\n  /disregard\\s+(all\\s+)?previous/i,\n  /dev\\s*mode/i,\n  /jailbreak/i,\n  /\\bdan\\b/i,\n  /system\\s*prompt/i,\n  /you\\s+are\\s+now/i,\n  /act\\s+as\\s+a/i,\n  /forget\\s+(everything|your\\s+role)/i,\n  /override\\s+(dosage|schedule|medication)/i,\n  /delete\\s+(all\\s+)?calendar/i,\n  /bypass\\s+validation/i\n];\n\nlet isBlocked = false;\nlet detectedPattern = \"\";\n\nfor (let i = 0; i < maliciousPatterns.length; i++) {\n  if (maliciousPatterns[i].test(normalizedText)) {\n    isBlocked = true;\n    detectedPattern = maliciousPatterns[i].toString();\n    break;\n  }\n}\n\n// 3. Sanitization\nconst sanitizedText = deidentifiedText.replace(/[<>{}]/g, '');\n\n// 4. Return Output (تم تصحيح علامات التنصيص هنا)\nreturn {\n  json: {\n    isBlocked: isBlocked,\n    sanitizedInput: sanitizedText,\n    blockReason: isBlocked ? (\"Malicious pattern detected: \" + detectedPattern) : null,\n    mapping: mapping,\n    request_id: requestId,\n    originalDeidentified: deidentifiedText\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1328,
+        352
+      ],
+      "id": "5820a65e-b184-48c6-9cf5-498e95cf435d",
+      "name": "Pre Filtering"
+    },
+    {
+      "parameters": {
+        "message": "Sorry, Try Failed",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.3,
+      "position": [
+        688,
+        336
+      ],
+      "id": "7438701f-4498-4d52-9804-7c024f825a28",
+      "name": "Chat1",
+      "webhookId": "06ac8544-2587-4b14-babe-fcddb211c706"
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputItem = $input.item.json;\n\n// Safe fallback extraction across all node outputs\nconst sanitizedInput = inputItem.sanitizedInput || inputItem.guardrailsInput || inputItem.text || \"\";\n\n// Safe string concatenation using standard quotes\nconst formattedUserInput = \"<user_input>\\n\" + sanitizedInput + \"\\n</user_input>\";\n\nreturn {\n  json: {\n    formattedPrompt: formattedUserInput,\n    mapping: inputItem.mapping || {},\n    request_id: inputItem.request_id || \"\"\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -816,
+        192
+      ],
+      "id": "30d72694-1804-40cb-b9e1-d8296d5a2462",
+      "name": "Separetor"
+    },
+    {
+      "parameters": {
+        "toolDescription": "Search OpenFDA database for drug warning details and adverse interactions. Input should be the generic drug name.",
+        "url": "https://api.fda.gov/drug/label.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('parameters0_Value', `Search OpenFDA for a drug. You MUST construct the query string using full-text search with double quotes or wildcard search. \nFormat options:\n1) Full text search: \"openfda.brand_name:\\\\\"<DRUG>\\\\\"+OR+openfda.generic_name:\\\\\"<DRUG>\\\\\"\"\n2) Simple name search: \"<DRUG>\"\nExamples:\n- \"Amaryl\"\n- \"Concor\"\n- \"openfda.brand_name:\\\\\"Amaryl\\\\\"+OR+openfda.generic_name:\\\\\"Amaryl\\\\\"\"`, 'string') }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.5,
+      "position": [
+        -336,
+        592
+      ],
+      "id": "c5d050b7-4dd4-4cfe-840d-9a04a9e315e5",
+      "name": "Openfda_drug_search"
+    },
+    {
+      "parameters": {
+        "text": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Prompt__User_Message_', ``, 'string') }}",
+        "options": {
+          "systemMessage": "You are a Patient Engagement & Adherence AI Specialist.\nYour task is to receive the medication summary and safety report passed to you from Agent 1.\nYou must:\n1. Create a simplified, easy-to-understand medication reminder schedule for the patient.\n2. Use the MSP Calendar MCP Tool to create reminder events in the system.\n3. Return a helpful confirmation message summarizing the scheduled reminders and key precautions.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agentTool",
+      "typeVersion": 3,
+      "position": [
+        -624,
+        704
+      ],
+      "id": "0ed67554-39f6-4844-bb8a-b73cae3490b8",
+      "name": "AI Agent Tool"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -752,
+        864
+      ],
+      "id": "85a13692-3797-4e94-bf66-d09ceae65e45",
+      "name": "Google Gemini Chat Model1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "3RkurTNcEaGf5ESD",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        -560,
+        880
+      ],
+      "id": "5daa2585-5e7c-44e4-a586-8721ef2aa899",
+      "name": "Simple Memory1"
+    },
+    {
+      "parameters": {
+        "endpointUrl": "https://mcp.smithery.ai/kerobasem347",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.4,
+      "position": [
+        -464,
+        928
+      ],
+      "id": "add779ed-e9e8-4149-aa63-2679696c673c",
+      "name": "MCP Client",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "e7PJAAq2KQmHe5Ml",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.formattedPrompt }}",
+        "options": {
+          "systemMessage": "You are an expert Clinical Pharmacology & Safety AI Assistant. Your goal is to converse with the patient with empathy, clarity, and professionalism. \n\nFollow these steps strictly and sequentially:\n\n1. Information Collection: \n   - Collect and confirm the patient's full info, including age, existing medical conditions, and all current medications.\n\n2. Safety & Interaction Check: \n   - Once you have the list of medications, use the OpenFDA HTTP Tool to search for potential drug interactions, contraindications, or warnings.\n   - Present a structured summary of the patient's medications and any clinical safety warnings found. Explain these safety points clearly to the patient.\n\n3. Calendar Reminder & Scheduling (Sub-Workflow):\n   - After discussing the safety brief, ask the patient if they would like to add the medication to their Google Calendar and ask for their preferred schedule.\n   - To avoid errors, you can guide the patient by giving them an example, like telling them: \"You can write something like: Concor, starting today at 8:00 PM, twice a day.\"\n   - Once the patient provides the medication and timing, you MUST automatically parse and convert their text into the exact required parameters for the tool:\n     * summary: The medication name and dose (e.g., \"Concor 5mg\")\n     * start_datetime: ISO 8601 format (e.g., \"2026-08-29T20:00:00\")\n     * end_datetime: ISO 8601 format (e.g., \"2026-08-29T21:00:00\")\n   - Invoke the Sub-Workflow tool immediately with these structured parameters, then provide a clear confirmation message to the patient that the reminder has been successfully set.\n\n- FINANCIAL BOUNDARY: If the user asks non-medical financial questions (e.g., selling assets/stocks to pay for treatment), output an Out-of-Scope boundary response and redirect them to a financial counselor.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -672,
+        384
+      ],
+      "id": "5801f4e2-a517-4b9c-b26e-d8eaf17af1ee",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        -672,
+        624
+      ],
+      "id": "bfe0298a-15f8-41b2-83b7-dbfd075faf3d",
+      "name": "Simple Memory2"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -912,
+        608
+      ],
+      "id": "9dae2d5e-5017-4a7b-be2d-1f4276c0dc52",
+      "name": "Google Gemini Chat Model2",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "3RkurTNcEaGf5ESD",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const agentOutput = $json.output || $json.text || \"\";\nconst mapping = $json.mapping || {};\nconst requestId = $json.request_id || \"\";\n\nlet isOutputViolating = false;\nlet violationReason = null;\n\n// 1. فحص تسريب التعليمات (System Prompt Leakage Check)\nconst leakagePatterns = [\n  /<system_instructions>/i,\n  /CRITICAL SECURITY RULES/i,\n  /You are an expert Clinical Medication Management Assistant/i\n];\n\nfor (const pattern of leakagePatterns) {\n  if (pattern.test(agentOutput)) {\n    isOutputViolating = true;\n    violationReason = \"System prompt leakage detected in output.\";\n    break;\n  }\n}\n\n// 2. فحص السلامة الدوائية (Dosing & Refusal Rules)\n// التأكد من عدم إعطاء جرعات صريحة بدون إخلاء مسؤولية طبي معتمد\nconst hasDosingNumbers = /\\b\\d+(\\.\\d+)?\\s*(mg|g|ml|mcg|units|كبسولة|قرص|قرصين)\\b/i.test(agentOutput);\nconst hasDisclaimer = /طبيب|صيدلي|استشارة|prescribed|physician|consult/i.test(agentOutput);\n\nif (hasDosingNumbers && !hasDisclaimer) {\n  // إضافة إخلاء مسؤولية تلقائي حمايةً للمريض\n  var safeOutput = agentOutput + \"\\n\\nتنبيّه طبي: يرجى مراجعة الطبيب أو الصيدلي لتأكيد الجرعة المحددة.\";\n} else {\n  var safeOutput = agentOutput;\n}\n\nreturn {\n  json: {\n    isOutputViolating: isOutputViolating,\n    validatedOutput: isOutputViolating ? \"عذراً، تعذر إظهار الرد لدواعي أمان المخرجات الطبية.\" : safeOutput,\n    violationReason: violationReason,\n    mapping: mapping,\n    request_id: requestId\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -288,
+        352
+      ],
+      "id": "3704c25a-dc9e-483a-a463-5744e6ff87fc",
+      "name": "Output Validation & Refusal Rules"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "91c68330-89e0-4860-b46e-4a64600b651a",
+              "leftValue": "={{ $json.isOutputViolating }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -64,
+        352
+      ],
+      "id": "a1c0daaf-f54a-4af9-95bf-d25f5f388d1e",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "message": "=Sorry, Try Failed",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.3,
+      "position": [
+        272,
+        128
+      ],
+      "id": "001bacc0-26c4-4180-99dd-80d3d059d9d7",
+      "name": "Chat2",
+      "webhookId": "df1fbc69-fc69-4e8a-9e23-b782739a2a17"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=[PRIMARY_RESPONSE_TO_EVALUATE]\n{{ $json.validatedOutput }}\n[/PRIMARY_RESPONSE_TO_EVALUATE]\n\nEvaluate the text inside the brackets. If safe, output the exact same text inside the brackets.\n\n\"Status: Pending Senior Clinician Sign-off. This off-label recommendation has been quarantined for review.\"",
+        "options": {
+          "systemMessage": "<guardian_instructions>\nYou are a Strict Medical Safety Evaluator. Your ONLY job is to verify if the primary model's response contains hallucinations, dangerous dosage/drug recommendations, or safety violations.\n\nCRITICAL RULES:\n1. If the response is SAFE: Return the EXACT input text AS-IS without adding, removing, or rephrasing a single character. Do NOT talk to the user.\n2. If the response is UNSAFE / VIOLATES SAFETY: Override and return ONLY the standardized rejection message.\n\nDo NOT act as a chatbot. Do NOT greet the user. Pass through or override only.\n</guardian_instructions>"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        160,
+        384
+      ],
+      "id": "e6441c59-beba-4996-86d1-3edd05928eca",
+      "name": "Safety Guardian agent"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        80,
+        560
+      ],
+      "id": "85136068-7869-48d3-acbe-39897a165796",
+      "name": "Google Gemini Chat Model3",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "3RkurTNcEaGf5ESD",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        240,
+        592
+      ],
+      "id": "2397e628-81d2-42ec-9d91-e031347c1c39",
+      "name": "Simple Memory3"
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.sanitizedInput }}",
+        "guardrails": {
+          "jailbreak": {
+            "value": {
+              "threshold": 0.7
+            }
+          }
+        },
+        "customizeSystemMessage": true,
+        "systemMessage": "Check if the user input asks for dangerous substances, toxic doses, or medications intended to harm or kill humans or animals (e.g., \"drug to kill cat\", \"poison\").\nIf any harm, toxicity, or animal violence is requested, mark it as a violation immediately."
+      },
+      "type": "@n8n/n8n-nodes-langchain.guardrails",
+      "typeVersion": 2,
+      "position": [
+        -1184,
+        352
+      ],
+      "id": "b489195d-66cc-4992-bddd-a12857718ab9",
+      "name": "Guardrails"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -1200,
+        560
+      ],
+      "id": "8f370540-c4d4-4bf6-9450-91aa9fcff708",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "3RkurTNcEaGf5ESD",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "fc7fa02d-91f9-4b7a-936e-3cb9b2829ec7",
+              "leftValue": "={{ $json.isOutputViolating }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        464,
+        416
+      ],
+      "id": "72f0793f-fcd4-4462-8da5-ce4c5c74b954",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "sendTo": "kerobasem347@gmail.com",
+        "subject": "=[SAFETY INCIDENT ALERT] Medical AI Violation Detected - ID: {{ $json.request_id || \"N/A\" }}",
+        "message": "=CRITICAL SAFETY ESCALATION REPORT --------------------------------- Timestamp: {{ $now.format('YYYY-MM-DD HH:mm:ss') }} Request ID: {{ $json.request_id || \"N/A\" }}  USER INPUT: {{ $json.sanitizedInput || $json.guardrailsInput || \"N/A\" }}  STATUS: Blocked by Safety Guardian Node. Reason: Potential policy violation (Animal Harm / Lethal Dosing / Jailbreak Attempt).  Action Taken: Automated Escalation to Security Officer & Incident Logged.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        -816,
+        416
+      ],
+      "id": "a49f6ff4-b4a4-46b1-8d95-db0f6fc4f34b",
+      "name": "Send a message",
+      "webhookId": "14c32af3-f0b2-4233-a9e6-c3da3dea7db2",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "M72ixdTKENXpr9rq",
+          "name": "Gmail account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Regex detect": {
+      "main": [
+        [
+          {
+            "node": "Presidio analyze",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Presidio analyze": {
+      "main": [
+        [
+          {
+            "node": "De-identify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-identify": {
+      "main": [
+        [
+          {
+            "node": "Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Regex detect",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "De-identify": {
+      "main": [
+        [
+          {
+            "node": "Pre Filtering",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre Filtering": {
+      "main": [
+        [
+          {
+            "node": "Guardrails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Openfda_drug_search": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent Tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent Tool",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent Tool",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP Client": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent Tool",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory2": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Separetor": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "Output Validation & Refusal Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Output Validation & Refusal Rules": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Chat2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Safety Guardian agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model3": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Safety Guardian agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory3": {
+      "ai_memory": [
+        [
+          {
+            "node": "Safety Guardian agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Safety Guardian agent": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrails": {
+      "main": [
+        [
+          {
+            "node": "Separetor",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Guardrails",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Chat1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Re-identify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "9b263dbc-28ca-430b-9847-bfd45afa3623",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6b63f910511f550f169f2c5fe461768d4aaf66506c03e33eb6f9062ad5af4a83"
+  },
+  "nodeGroups": [],
+  "id": "WEhTso5TMr9OyjJz",
+  "tags": []
+}
