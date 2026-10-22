@@ -127,12 +127,9 @@ The overall workflow can be summarized as:
 Patient
    │
    ▼
-   
 n8n Chat Interface
    │
    ▼
-
-   
 PII Detection
    │
    ├── Regex Detection
